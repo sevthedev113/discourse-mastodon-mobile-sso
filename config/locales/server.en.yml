@@ -1,0 +1,4 @@
+en:
+  site_settings:
+    mastodon_sso_host: "Base URL of the Mastodon server used for mobile SSO, for example https://mastodon.example.com"
+    mastodon_sso_staff_email_allowlist: "Mastodon-confirmed emails that may sign in as an existing admin or moderator. Staff with any other email are never linked automatically."

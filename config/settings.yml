@@ -1,0 +1,7 @@
+discourse_mastodon_mobile_sso:
+  mastodon_sso_host:
+    default: ""
+  mastodon_sso_staff_email_allowlist:
+    default: ""
+    type: list
+    list_type: simple
