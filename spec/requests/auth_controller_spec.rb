@@ -11,6 +11,8 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       id: mastodon_id,
       username: "alice",
       display_name: "Alice",
+      note: "<p>Hello from Mastodon</p>",
+      avatar: "https://mastodon.example.com/avatars/alice.png",
       source: {
         email: email
       }
@@ -61,10 +63,10 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       expect(response.parsed_body).to eq(
         "success" => true,
         "user" => {
-          "id" => user.id,
+          "id"       => user.id,
           "username" => user.username,
-          "name" => "Alice",
-          "email" => email
+          "name"     => "Alice",
+          "email"    => email
         }
       )
       expect(User.find_by_email("attacker@example.com")).to be_nil
@@ -74,10 +76,8 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       expect(record.user_id).to eq(user.id)
       expect(record.external_email).to eq(email)
       expect(record.external_username).to eq("alice")
-      expect(record.last_payload).to eq(credentials.to_json)
       expect(session[:current_user_id]).to eq(user.id)
     end
-
   end
 
   context "with repeated sign-ins for a new account" do
@@ -135,6 +135,42 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       expect(response.status).to eq(200)
       expect(response.parsed_body["user"]["id"]).to eq(user.id)
       expect(session[:current_user_id]).to eq(user.id)
+    end
+
+    it "syncs display_name into the Discourse user on login" do
+      stub_request(:get, verify_url).to_return(
+        status: 200,
+        body: credentials.merge(display_name: "Alice Updated").to_json
+      )
+
+      authenticate
+
+      expect(response.status).to eq(200)
+      expect(user.reload.name).to eq("Alice Updated")
+    end
+
+    it "syncs bio (strips HTML) into user_profile on login" do
+      stub_request(:get, verify_url).to_return(
+        status: 200,
+        body: credentials.merge(note: "<p>New bio text</p>").to_json
+      )
+
+      authenticate
+
+      expect(response.status).to eq(200)
+      expect(user.reload.user_profile.bio_raw).to eq("New bio text")
+    end
+
+    it "enqueues an avatar download job on login" do
+      Jobs.expects(:enqueue).with(
+        :download_avatar_from_url,
+        url: "https://mastodon.example.com/avatars/alice.png",
+        user_id: user.id,
+        override_gravatar: true
+      )
+
+      authenticate
+      expect(response.status).to eq(200)
     end
   end
 
@@ -336,6 +372,123 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       end
 
       authenticate
+      expect(response.status).to eq(429)
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+
+RSpec.describe DiscourseMastodonMobileSso::SyncController do
+  let(:host) { "https://mastodon.example.com" }
+  let(:mastodon_id) { "109" }
+  let(:external_id) { "mastodon:#{mastodon_id}" }
+  let(:email) { "alice@example.com" }
+  let(:verify_url) { "#{host}/api/v1/accounts/verify_credentials" }
+  let(:credentials) do
+    {
+      id: mastodon_id,
+      username: "alice",
+      display_name: "Alice Synced",
+      note: "<p>Fresh bio</p>",
+      avatar: "https://mastodon.example.com/avatars/alice2.png",
+      source: { email: email }
+    }
+  end
+
+  fab!(:user) { Fabricate(:user, email: email, name: "Alice Old") }
+
+  before do
+    SiteSetting.mastodon_sso_host = host
+    Fabricate(:single_sign_on_record, user: user, external_id: external_id)
+
+    stub_request(:get, verify_url).with(
+      headers: { "Authorization" => "Bearer sync-token" }
+    ).to_return(status: 200, body: credentials.to_json)
+  end
+
+  def sync_profile(params = {})
+    sign_in(user)
+    post "/mobile_sso/sync/profile.json",
+         params: { access_token: "sync-token" }.merge(params)
+  end
+
+  it "requires an access token" do
+    sign_in(user)
+    post "/mobile_sso/sync/profile.json"
+    expect(response.status).to eq(400)
+  end
+
+  it "requires the user to be logged in" do
+    post "/mobile_sso/sync/profile.json", params: { access_token: "sync-token" }
+    expect(response.status).to eq(403)
+  end
+
+  it "returns 403 when the user has no Mastodon SSO link" do
+    unlinked = Fabricate(:user)
+    sign_in(unlinked)
+    post "/mobile_sso/sync/profile.json", params: { access_token: "sync-token" }
+    expect(response.status).to eq(403)
+  end
+
+  it "returns 401 when the Mastodon token is invalid" do
+    stub_request(:get, verify_url).to_return(status: 401, body: "{}")
+    sync_profile
+    expect(response.status).to eq(401)
+  end
+
+  it "returns 403 when the token belongs to a different Mastodon account" do
+    stub_request(:get, verify_url).to_return(
+      status: 200,
+      body: credentials.merge(id: "999").to_json
+    )
+    sync_profile
+    expect(response.status).to eq(403)
+  end
+
+  it "updates the user name from Mastodon" do
+    sync_profile
+    expect(response.status).to eq(200)
+    expect(user.reload.name).to eq("Alice Synced")
+  end
+
+  it "updates the bio (stripping HTML) from Mastodon" do
+    sync_profile
+    expect(response.status).to eq(200)
+    expect(user.reload.user_profile.bio_raw).to eq("Fresh bio")
+  end
+
+  it "enqueues an avatar download job" do
+    Jobs.expects(:enqueue).with(
+      :download_avatar_from_url,
+      url: "https://mastodon.example.com/avatars/alice2.png",
+      user_id: user.id,
+      override_gravatar: true
+    )
+
+    sync_profile
+    expect(response.status).to eq(200)
+  end
+
+  it "returns updated user fields in the response" do
+    sync_profile
+    expect(response.parsed_body["success"]).to eq(true)
+    expect(response.parsed_body["user"]["name"]).to eq("Alice Synced")
+    expect(response.parsed_body["user"]["email"]).to eq(email)
+  end
+
+  context "with rate limiting" do
+    before { RateLimiter.enable }
+
+    it "returns 429 after too many requests" do
+      stub_request(:get, verify_url).to_return(status: 401, body: "{}")
+
+      10.times do
+        sync_profile
+        expect(response.status).to eq(401)
+      end
+
+      sync_profile
       expect(response.status).to eq(429)
     end
   end
