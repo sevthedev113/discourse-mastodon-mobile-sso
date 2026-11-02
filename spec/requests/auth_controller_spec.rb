@@ -63,10 +63,10 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       expect(response.parsed_body).to eq(
         "success" => true,
         "user" => {
-          "id"       => user.id,
+          "id" => user.id,
           "username" => user.username,
-          "name"     => "Alice",
-          "email"    => email
+          "name" => "Alice",
+          "email" => email
         }
       )
       expect(User.find_by_email("attacker@example.com")).to be_nil
@@ -76,6 +76,9 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       expect(record.user_id).to eq(user.id)
       expect(record.external_email).to eq(email)
       expect(record.external_username).to eq("alice")
+      expect(JSON.parse(record.last_payload)["avatar"]).to eq(
+        credentials[:avatar]
+      )
       expect(session[:current_user_id]).to eq(user.id)
     end
   end
@@ -107,12 +110,12 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
     it "serializes sign-ins per Mastodon account" do
       # Other code (e.g. chat auto-join) takes its own mutexes, so only pin ours.
       allow(DistributedMutex).to receive(:synchronize).and_call_original
-      expect(DistributedMutex).to receive(:synchronize).with(
-        "mastodon-mobile-sso-#{external_id}",
-        validity: 30
-      ).and_call_original
 
       authenticate
+      expect(DistributedMutex).to have_received(:synchronize).with(
+        "mastodon-mobile-sso-#{external_id}",
+        validity: 30
+      )
       expect(response.status).to eq(200)
     end
   end
@@ -162,14 +165,16 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
     end
 
     it "enqueues an avatar download job on login" do
-      Jobs.expects(:enqueue).with(
-        :download_avatar_from_url,
-        url: "https://mastodon.example.com/avatars/alice.png",
-        user_id: user.id,
-        override_gravatar: true
-      )
+      expect { authenticate }.to change {
+        Jobs::DownloadAvatarFromUrl.jobs.count
+      }.by(1)
 
-      authenticate
+      job_args = Jobs::DownloadAvatarFromUrl.jobs.last["args"].first
+      expect(job_args).to include(
+        "url" => "https://mastodon.example.com/avatars/alice.png",
+        "user_id" => user.id,
+        "override_gravatar" => true
+      )
       expect(response.status).to eq(200)
     end
   end
@@ -234,7 +239,8 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
 
   context "with an existing user that cannot be linked" do
     it "activates and links an unactivated user whose email Mastodon confirmed" do
-      inactive = Fabricate(:inactive_user, email: email, password: "s3cret-passw0rd-old")
+      inactive =
+        Fabricate(:inactive_user, email: email, password: "s3cret-passw0rd-old")
       old_token = UserAuthToken.generate!(user_id: inactive.id)
 
       expect { authenticate }.not_to change { User.count }
@@ -260,7 +266,8 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
     end
 
     it "links an admin whose email is on the staff allowlist" do
-      SiteSetting.mastodon_sso_staff_email_allowlist = "Other@example.com|ALICE@example.com"
+      SiteSetting.mastodon_sso_staff_email_allowlist =
+        "Other@example.com|ALICE@example.com"
       admin = Fabricate(:admin, email: email)
 
       authenticate
@@ -275,7 +282,9 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
 
       authenticate
       expect(response.status).to eq(409)
-      expect(response.parsed_body["data"]["code"]).to eq("staff_not_allowlisted")
+      expect(response.parsed_body["data"]["code"]).to eq(
+        "staff_not_allowlisted"
+      )
       expect_no_login_or_link
     end
 
@@ -293,7 +302,9 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
 
       authenticate
       expect(response.status).to eq(409)
-      expect(response.parsed_body["data"]["code"]).to eq("staff_not_allowlisted")
+      expect(response.parsed_body["data"]["code"]).to eq(
+        "staff_not_allowlisted"
+      )
       expect_no_login_or_link
     end
 
@@ -302,7 +313,9 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
 
       authenticate
       expect(response.status).to eq(409)
-      expect(response.parsed_body["data"]["code"]).to eq("staff_not_allowlisted")
+      expect(response.parsed_body["data"]["code"]).to eq(
+        "staff_not_allowlisted"
+      )
       expect_no_login_or_link
     end
   end
@@ -392,18 +405,24 @@ RSpec.describe DiscourseMastodonMobileSso::SyncController do
       display_name: "Alice Synced",
       note: "<p>Fresh bio</p>",
       avatar: "https://mastodon.example.com/avatars/alice2.png",
-      source: { email: email }
+      source: {
+        email: email
+      }
     }
   end
 
-  fab!(:user) { Fabricate(:user, email: email, name: "Alice Old") }
+  fab!(:user) do
+    Fabricate(:user, email: "alice@example.com", name: "Alice Old")
+  end
 
   before do
     SiteSetting.mastodon_sso_host = host
     Fabricate(:single_sign_on_record, user: user, external_id: external_id)
 
     stub_request(:get, verify_url).with(
-      headers: { "Authorization" => "Bearer sync-token" }
+      headers: {
+        "Authorization" => "Bearer sync-token"
+      }
     ).to_return(status: 200, body: credentials.to_json)
   end
 
@@ -452,22 +471,80 @@ RSpec.describe DiscourseMastodonMobileSso::SyncController do
     expect(user.reload.name).to eq("Alice Synced")
   end
 
+  it "updates the email from Mastodon" do
+    stub_request(:get, verify_url).with(
+      headers: {
+        "Authorization" => "Bearer sync-token"
+      }
+    ).to_return(
+      status: 200,
+      body:
+        credentials.deep_merge(
+          source: {
+            email: "alice.new@example.com"
+          }
+        ).to_json
+    )
+
+    sync_profile
+
+    expect(response.status).to eq(200)
+    expect(user.reload.email).to eq("alice.new@example.com")
+  end
+
   it "updates the bio (stripping HTML) from Mastodon" do
     sync_profile
     expect(response.status).to eq(200)
     expect(user.reload.user_profile.bio_raw).to eq("Fresh bio")
   end
 
-  it "enqueues an avatar download job" do
-    Jobs.expects(:enqueue).with(
-      :download_avatar_from_url,
-      url: "https://mastodon.example.com/avatars/alice2.png",
-      user_id: user.id,
-      override_gravatar: true
+  it "blocks linked users from editing Mastodon-owned profile fields in Discourse" do
+    guardian = Guardian.new(user)
+    expect(guardian.can_edit_email?(user)).to eq(false)
+    expect(guardian.can_edit_name?(user)).to eq(false)
+    expect(guardian.can_edit_avatar?(user)).to eq(false)
+    serializer = UserSerializer.new(user, scope: guardian, root: false)
+    expect(serializer.can_change_bio).to eq(false)
+    expect(serializer.can_change_location).to eq(false)
+    expect(serializer.can_change_website).to eq(false)
+
+    UserUpdater.new(user, user).update(
+      bio_raw: "Changed locally",
+      location: "Changed locally",
+      website: "https://changed.example.com"
     )
 
-    sync_profile
+    expect(user.reload.user_profile.bio_raw).not_to eq("Changed locally")
+    expect(user.user_profile.location).not_to eq("Changed locally")
+    expect(user.user_profile.website).not_to eq("https://changed.example.com")
+  end
+
+  it "enqueues an avatar download job" do
+    expect { sync_profile }.to change {
+      Jobs::DownloadAvatarFromUrl.jobs.count
+    }.by(1)
+
+    job_args = Jobs::DownloadAvatarFromUrl.jobs.last["args"].first
+    expect(job_args).to include(
+      "url" => "https://mastodon.example.com/avatars/alice2.png",
+      "user_id" => user.id,
+      "override_gravatar" => true
+    )
     expect(response.status).to eq(200)
+  end
+
+  it "does not enqueue an avatar download when the URL is unchanged" do
+    SingleSignOnRecord.find_by!(
+      user_id: user.id,
+      external_id: external_id
+    ).update_columns(last_payload: credentials.to_json)
+    expect { sync_profile }.not_to change {
+      Jobs::DownloadAvatarFromUrl.jobs.count
+    }
+
+    expect(response.status).to eq(200)
+    expect(user.reload.name).to eq("Alice Synced")
+    expect(user.user_profile.bio_raw).to eq("Fresh bio")
   end
 
   it "returns updated user fields in the response" do

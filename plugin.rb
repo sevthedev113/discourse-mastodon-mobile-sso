@@ -10,28 +10,85 @@ after_initialize do
   # Mastodon is the source of truth for profile data.
   # Prevent users from editing these fields directly inside Discourse.
   # ---------------------------------------------------------------------------
-  on(:site_setting_saved) {}  # hook point kept for future use
-
-  register_modifier(:user_can_edit_profile_details) do |_default, user|
-    # Non-SSO users (staff who may have no SSO record) retain full edit access.
-    has_mastodon_sso = SingleSignOnRecord.where(user_id: user.id)
-                                         .where("external_id LIKE 'mastodon:%'")
-                                         .exists?
-    !has_mastodon_sso
-  end
+  on(:site_setting_saved) {} # hook point kept for future use
 
   module ::DiscourseMastodonMobileSso
+    # These Guardian checks drive both profile UI permissions and server-side guards.
+    module GuardianExtension
+      def mastodon_sso_linked?(target_user)
+        # Bind the pattern so its % wildcard is not parsed as a format token.
+        SingleSignOnRecord
+          .where(user_id: target_user.id)
+          .where("external_id LIKE ?", "mastodon:%")
+          .exists?
+      end
+
+      def can_edit_email?(target_user)
+        return false if mastodon_sso_linked?(target_user)
+        super
+      end
+
+      def can_edit_name?(target_user)
+        return false if mastodon_sso_linked?(target_user)
+        super
+      end
+
+      def can_edit_avatar?(target_user)
+        return false if mastodon_sso_linked?(target_user)
+        super
+      end
+    end
+
+    module UserUpdaterExtension
+      def update(attributes = {})
+        if Guardian.new(@actor).mastodon_sso_linked?(@user)
+          # UserUpdater has no Guardian check for these fields, so discard them here as
+          # well as hiding their controls in the serializer.
+          attributes =
+            attributes.except(
+              :bio_raw,
+              "bio_raw",
+              :location,
+              "location",
+              :website,
+              "website"
+            )
+        end
+        super(attributes)
+      end
+    end
+
+    module UserSerializerExtension
+      # These flags hide Mastodon-owned controls in the profile and account settings UI.
+      def can_change_bio
+        super && !scope.mastodon_sso_linked?(object)
+      end
+
+      def can_change_location
+        super && !scope.mastodon_sso_linked?(object)
+      end
+
+      def can_change_website
+        super && !scope.mastodon_sso_linked?(object)
+      end
+    end
+
     class Engine < ::Rails::Engine
       engine_name "discourse_mastodon_mobile_sso"
       isolate_namespace DiscourseMastodonMobileSso
     end
+
+    Guardian.prepend(GuardianExtension)
+    UserUpdater.prepend(UserUpdaterExtension)
+    UserSerializer.prepend(UserSerializerExtension)
 
     # -------------------------------------------------------------------------
     # Shared helpers used by both AuthController and SyncController.
     # -------------------------------------------------------------------------
     module MastodonApi
       # Raised when mastodon_sso_host is blank; answered with 503 instead of a generic 500.
-      class NotConfigured < StandardError; end
+      class NotConfigured < StandardError
+      end
 
       OPEN_TIMEOUT = 5
       READ_TIMEOUT = 10
@@ -39,7 +96,9 @@ after_initialize do
       # GET against the configured Mastodon server with the caller's bearer token.
       def mastodon_get(path, token)
         host = SiteSetting.mastodon_sso_host.to_s.strip.chomp("/")
-        raise NotConfigured, "mastodon_sso_host is not configured" if host.blank?
+        if host.blank?
+          raise NotConfigured, "mastodon_sso_host is not configured"
+        end
 
         uri = URI("#{host}#{path}")
         req = Net::HTTP::Get.new(uri)
@@ -66,22 +125,32 @@ after_initialize do
       # mastodon_user – parsed JSON from /api/v1/accounts/verify_credentials
       def sync_profile(user, mastodon_user)
         changes = {}
+        # Keep the LIKE wildcard bound; interpolating this pattern alongside a hash
+        # condition raised a format error and stopped sync before any fields were applied.
+        sso =
+          SingleSignOnRecord
+            .where(user_id: user.id)
+            .where("external_id LIKE ?", "mastodon:%")
+            .first
 
         # --- name -----------------------------------------------------------
-        new_name = mastodon_user["display_name"].presence || mastodon_user["username"]
+        new_name =
+          mastodon_user["display_name"].presence || mastodon_user["username"]
         changes[:name] = new_name if new_name.present? && user.name != new_name
 
         # --- email ----------------------------------------------------------
         # Only update when Mastodon returns a confirmed email that differs.
         new_email = mastodon_user.dig("source", "email").to_s.strip.downcase
-        if EmailAddressValidator.valid_value?(new_email) && user.email != new_email
+        if EmailAddressValidator.valid_value?(new_email) &&
+             user.email != new_email
           # Discourse wraps primary email in user_emails; update it safely.
           begin
             user.primary_email.update!(email: new_email, primary: true)
-            sso = SingleSignOnRecord.find_by(
-              "external_id LIKE 'mastodon:%'",
-              user_id: user.id
-            )
+            sso =
+              SingleSignOnRecord
+                .where(user_id: user.id)
+                .where("external_id LIKE ?", "mastodon:%")
+                .first
             sso&.update_columns(external_email: new_email)
           rescue => e
             Rails.logger.warn(
@@ -100,18 +169,27 @@ after_initialize do
 
         # --- avatar ---------------------------------------------------------
         avatar_url = mastodon_user["avatar"].to_s.strip
-        if avatar_url.present?
-          Jobs.enqueue(:download_avatar_from_url, url: avatar_url, user_id: user.id, override_gravatar: true)
+        # last_payload is the last successful Mastodon snapshot; avoid re-downloading when
+        # the URL is unchanged. The first-link payload omits avatar so it downloads once.
+        previous_avatar_url =
+          begin
+            JSON.parse(sso&.last_payload.to_s)["avatar"].to_s.strip
+          rescue JSON::ParserError
+            ""
+          end
+        if avatar_url.present? && avatar_url != previous_avatar_url
+          Jobs.enqueue(
+            :download_avatar_from_url,
+            url: avatar_url,
+            user_id: user.id,
+            override_gravatar: true
+          )
         end
 
         # Apply scalar field changes (name, etc.) atomically.
         user.update!(changes) if changes.any?
 
         # Keep SingleSignOnRecord in sync with what we just applied.
-        sso = SingleSignOnRecord.find_by(
-          "external_id LIKE 'mastodon:%'",
-          user_id: user.id
-        )
         if sso
           sso.update_columns(
             external_name: new_name,
@@ -149,19 +227,30 @@ after_initialize do
       def authenticate
         mastodon_token = params[:access_token]
         if mastodon_token.blank?
-          return render json: { error: "Access token is required" }, status: :bad_request
+          return(
+            render json: {
+                     error: "Access token is required"
+                   },
+                   status: :bad_request
+          )
         end
 
         # Mastodon is the source of truth for who the token belongs to.
-        res = mastodon_get("/api/v1/accounts/verify_credentials", mastodon_token)
+        res =
+          mastodon_get("/api/v1/accounts/verify_credentials", mastodon_token)
         unless res.is_a?(Net::HTTPSuccess)
-          return render json: { error: "Invalid Mastodon token" }, status: :unauthorized
+          return(
+            render json: {
+                     error: "Invalid Mastodon token"
+                   },
+                   status: :unauthorized
+          )
         end
 
         mastodon_user = JSON.parse(res.body)
-        mastodon_id   = mastodon_user["id"]
+        mastodon_id = mastodon_user["id"]
         # The Mastodon id is the permanent link; usernames can change.
-        external_id   = "mastodon:#{mastodon_id}"
+        external_id = "mastodon:#{mastodon_id}"
 
         # One sign-in per Mastodon account at a time, so a double request can't create two users.
         user =
@@ -172,15 +261,27 @@ after_initialize do
 
         case user
         when :no_email
-          return render json: { error: "Unable to verify account" }, status: :forbidden
+          return(
+            render json: {
+                     error: "Unable to verify account"
+                   },
+                   status: :forbidden
+          )
         when :not_linkable
-          return render json: { error: "Unable to sign in with this account" }, status: :conflict
+          return(
+            render json: {
+                     error: "Unable to sign in with this account"
+                   },
+                   status: :conflict
+          )
         when :staff_not_allowed
           # The code lets the app show staff-specific guidance instead of the generic conflict text.
           return(
             render json: {
                      error: "Staff accounts need approval for mobile sign-in",
-                     data: { code: "staff_not_allowlisted" }
+                     data: {
+                       code: "staff_not_allowlisted"
+                     }
                    },
                    status: :conflict
           )
@@ -198,32 +299,46 @@ after_initialize do
         render json: {
                  success: true,
                  user: {
-                   id:       user.id,
+                   id: user.id,
                    username: user.username,
-                   name:     user.name,
-                   email:    user.email
+                   name: user.name,
+                   email: user.email
                  }
                }
       rescue MastodonApi::NotConfigured => e
         Rails.logger.error("Mastodon mobile SSO: #{e.message}")
-        render json: { error: "Mobile sign-in is unavailable" }, status: :service_unavailable
+        render json: {
+                 error: "Mobile sign-in is unavailable"
+               },
+               status: :service_unavailable
       rescue ActiveRecord::RecordInvalid => e
         Rails.logger.warn(
           "Mastodon mobile SSO: user creation failed: #{e.record.errors.full_messages.join(", ")}"
         )
-        render json: { error: "Unable to create account" }, status: :unprocessable_entity
+        render json: {
+                 error: "Unable to create account"
+               },
+               status: :unprocessable_entity
       rescue => e
         Rails.logger.error(
           "Mastodon mobile SSO failed: #{e.class}: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}"
         )
-        render json: { error: "Authentication failed" }, status: :internal_server_error
+        render json: {
+                 error: "Authentication failed"
+               },
+               status: :internal_server_error
       end
 
       private
 
       # Stops one IP from hammering the endpoint (and, through it, the Mastodon server).
       def apply_rate_limit
-        RateLimiter.new(nil, "mastodon-sso-#{request.remote_ip}", 20, 1.minute).performed!
+        RateLimiter.new(
+          nil,
+          "mastodon-sso-#{request.remote_ip}",
+          20,
+          1.minute
+        ).performed!
       end
 
       # Returns the Discourse user for this Mastodon account, or a symbol error key.
@@ -237,11 +352,15 @@ after_initialize do
         return :no_email if email.nil?
 
         existing_user = find_user_by_email(email)
-        return :not_linkable if existing_user && !linkable?(existing_user, external_id)
-        return :staff_not_allowed if existing_user&.staff? && !staff_email_allowed?(email)
+        if existing_user && !linkable?(existing_user, external_id)
+          return :not_linkable
+        end
+        if existing_user&.staff? && !staff_email_allowed?(email)
+          return :staff_not_allowed
+        end
 
         username = mastodon_user["username"]
-        name     = mastodon_user["display_name"].presence || username
+        name = mastodon_user["display_name"].presence || username
 
         # User and link are written together so a failure never leaves a half-linked account.
         User.transaction do
@@ -251,21 +370,22 @@ after_initialize do
           else
             user =
               User.create!(
-                email:    email,
+                email: email,
                 username: UserNameSuggester.suggest(username),
-                name:     name,
-                active:   true,
+                name: name,
+                active: true,
                 approved: true
               )
           end
 
           SingleSignOnRecord.create!(
-            user_id:           user.id,
-            external_id:       external_id,
-            external_name:     name,
+            user_id: user.id,
+            external_id: external_id,
+            external_name: name,
             external_username: username,
-            external_email:    email,
-            last_payload:      payload
+            external_email: email,
+            # Keep initial sync eligible for the first avatar download.
+            last_payload: JSON.parse(payload).except("avatar").to_json
           )
           user
         end
@@ -287,7 +407,10 @@ after_initialize do
       # Also matches addresses that differ only by +tags or dots when normalize_emails is on.
       def find_user_by_email(email)
         user = User.find_by_email(email)
-        user ||= UserEmail.find_by_normalized(email)&.user if SiteSetting.normalize_emails
+        user ||=
+          UserEmail.find_by_normalized(
+            email
+          )&.user if SiteSetting.normalize_emails
         user
       end
 
@@ -302,7 +425,10 @@ after_initialize do
 
       # Staff are linked only when an admin listed the exact Mastodon-confirmed email.
       def staff_email_allowed?(email)
-        SiteSetting.mastodon_sso_staff_email_allowlist_map.map(&:downcase).include?(email)
+        SiteSetting
+          .mastodon_sso_staff_email_allowlist_map
+          .map(&:downcase)
+          .include?(email)
       end
     end
 
@@ -323,23 +449,40 @@ after_initialize do
       def profile
         mastodon_token = params[:access_token]
         if mastodon_token.blank?
-          return render json: { error: "Access token is required" }, status: :bad_request
+          return(
+            render json: {
+                     error: "Access token is required"
+                   },
+                   status: :bad_request
+          )
         end
 
         # Only linked users can trigger a sync.
-        sso_record = SingleSignOnRecord
-                       .where(user_id: current_user.id)
-                       .where("external_id LIKE 'mastodon:%'")
-                       .first
+        sso_record =
+          SingleSignOnRecord
+            .where(user_id: current_user.id)
+            .where("external_id LIKE ?", "mastodon:%")
+            .first
         unless sso_record
-          return render json: { error: "Account is not linked to Mastodon" }, status: :forbidden
+          return(
+            render json: {
+                     error: "Account is not linked to Mastodon"
+                   },
+                   status: :forbidden
+          )
         end
 
         # Re-verify the token so we always pull fresh data and confirm the token
         # still belongs to this user.
-        res = mastodon_get("/api/v1/accounts/verify_credentials", mastodon_token)
+        res =
+          mastodon_get("/api/v1/accounts/verify_credentials", mastodon_token)
         unless res.is_a?(Net::HTTPSuccess)
-          return render json: { error: "Invalid Mastodon token" }, status: :unauthorized
+          return(
+            render json: {
+                     error: "Invalid Mastodon token"
+                   },
+                   status: :unauthorized
+          )
         end
 
         mastodon_user = JSON.parse(res.body)
@@ -347,8 +490,12 @@ after_initialize do
         # Guard against a token that belongs to a different Mastodon account.
         expected_id = sso_record.external_id.delete_prefix("mastodon:")
         if mastodon_user["id"].to_s != expected_id.to_s
-          return render json: { error: "Token does not match the linked Mastodon account" },
-                        status: :forbidden
+          return(
+            render json: {
+                     error: "Token does not match the linked Mastodon account"
+                   },
+                   status: :forbidden
+          )
         end
 
         sync_profile(current_user, mastodon_user)
@@ -357,33 +504,44 @@ after_initialize do
         render json: {
                  success: true,
                  user: {
-                   id:       current_user.id,
+                   id: current_user.id,
                    username: current_user.username,
-                   name:     current_user.name,
-                   email:    current_user.email
+                   name: current_user.name,
+                   email: current_user.email
                  }
                }
       rescue MastodonApi::NotConfigured => e
         Rails.logger.error("Mastodon profile sync: #{e.message}")
-        render json: { error: "Sync is unavailable" }, status: :service_unavailable
+        render json: {
+                 error: "Sync is unavailable"
+               },
+               status: :service_unavailable
       rescue => e
         Rails.logger.error(
           "Mastodon profile sync failed: #{e.class}: #{e.message}\n#{e.backtrace&.first(10)&.join("\n")}"
         )
-        render json: { error: "Profile sync failed" }, status: :internal_server_error
+        render json: {
+                 error: "Profile sync failed"
+               },
+               status: :internal_server_error
       end
 
       private
 
       def apply_rate_limit
-        RateLimiter.new(nil, "mastodon-sync-#{current_user&.id}", 10, 1.minute).performed!
+        RateLimiter.new(
+          nil,
+          "mastodon-sync-#{current_user&.id}",
+          10,
+          1.minute
+        ).performed!
       end
     end
   end
 
   DiscourseMastodonMobileSso::Engine.routes.draw do
-    post "/auth/mastodon"  => "auth#authenticate"
-    post "/sync/profile"   => "sync#profile"
+    post "/auth/mastodon" => "auth#authenticate"
+    post "/sync/profile" => "sync#profile"
   end
 
   # Exposes the engine at /mobile_sso so the full paths are:
