@@ -565,6 +565,9 @@ after_initialize do
     add_model_callback(::Chat::MessageReaction, :after_commit, on: :create) do
       DiscourseMastodonMobileSso::NativePushEvents.chat_reaction(self)
     end
+    add_model_callback(::Chat::MessageReaction, :after_commit, on: :destroy) do
+      DiscourseMastodonMobileSso::NativePushEvents.chat_reaction_removed(self)
+    end
   end
 
   on(:push_notification) do |user, payload|

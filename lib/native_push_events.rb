@@ -59,10 +59,39 @@ module DiscourseMastodonMobileSso
       return unless SiteSetting.mastodon_mobile_push_enabled
       message = reaction.chat_message
       recipient = message.user
+      return if !recipient || recipient.id == reaction.user_id
       return if recipient.user_option.like_notification_frequency ==
         UserOption.like_notification_frequency_type[:never]
+      return if UserCommScreener.new(acting_user: reaction.user, target_user_ids: [recipient.id])
+        .ignoring_or_muting_actor?(recipient.id)
+      create_chat_reaction_notification(recipient, reaction, message)
       return unless chat_allowed?(recipient, reaction.user, message, "reaction")
       notify_chat(recipient, reaction.user, message, "reaction", reaction.id)
+    end
+
+    # Makes chat reactions appear in notifications.json like topic reactions do.
+    def self.create_chat_reaction_notification(recipient, reaction, message)
+      Notification.create!(
+        user_id: recipient.id,
+        notification_type: Notification.types[:reaction],
+        data: {
+          display_username: reaction.user.username,
+          original_username: reaction.user.username,
+          chat_channel_id: message.chat_channel_id,
+          chat_channel_title: message.chat_channel.title(recipient),
+          chat_message_id: message.id,
+          chat_thread_id: message.thread_id,
+          chat_reaction_id: reaction.id,
+          emoji: reaction.emoji
+        }.compact.to_json
+      )
+    end
+
+    def self.chat_reaction_removed(reaction)
+      Notification
+        .where(notification_type: Notification.types[:reaction])
+        .where("data::jsonb ->> 'chat_reaction_id' = ?", reaction.id.to_s)
+        .destroy_all
     end
 
     def self.chat_allowed?(recipient, actor, message, event)
