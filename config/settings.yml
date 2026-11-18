@@ -1,4 +1,6 @@
 discourse_mastodon_mobile_sso:
+  mastodon_mobile_push_enabled:
+    default: false
   mastodon_sso_host:
     default: ""
   mastodon_sso_staff_email_allowlist:

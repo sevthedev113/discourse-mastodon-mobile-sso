@@ -10,17 +10,19 @@ after_initialize do
   # Mastodon is the source of truth for profile data.
   # Prevent users from editing these fields directly inside Discourse.
   # ---------------------------------------------------------------------------
-  on(:site_setting_saved) {} # hook point kept for future use
 
   module ::DiscourseMastodonMobileSso
     # These Guardian checks drive both profile UI permissions and server-side guards.
     module GuardianExtension
       def mastodon_sso_linked?(target_user)
         # Bind the pattern so its % wildcard is not parsed as a format token.
-        SingleSignOnRecord
-          .where(user_id: target_user.id)
-          .where("external_id LIKE ?", "mastodon:%")
-          .exists?
+        @mastodon_sso_linked ||= {}
+        @mastodon_sso_linked.fetch(target_user.id) do
+          @mastodon_sso_linked[target_user.id] = SingleSignOnRecord
+            .where(user_id: target_user.id)
+            .where("external_id LIKE ?", "mastodon:%")
+            .exists?
+        end
       end
 
       def can_edit_email?(target_user)
@@ -124,79 +126,11 @@ after_initialize do
 
       # mastodon_user – parsed JSON from /api/v1/accounts/verify_credentials
       def sync_profile(user, mastodon_user)
-        changes = {}
-        # Keep the LIKE wildcard bound; interpolating this pattern alongside a hash
-        # condition raised a format error and stopped sync before any fields were applied.
-        sso =
-          SingleSignOnRecord
-            .where(user_id: user.id)
-            .where("external_id LIKE ?", "mastodon:%")
-            .first
-
-        # --- name -----------------------------------------------------------
-        new_name =
-          mastodon_user["display_name"].presence || mastodon_user["username"]
-        changes[:name] = new_name if new_name.present? && user.name != new_name
-
-        # --- email ----------------------------------------------------------
-        # Only update when Mastodon returns a confirmed email that differs.
-        new_email = mastodon_user.dig("source", "email").to_s.strip.downcase
-        if EmailAddressValidator.valid_value?(new_email) &&
-             user.email != new_email
-          # Discourse wraps primary email in user_emails; update it safely.
-          begin
-            user.primary_email.update!(email: new_email, primary: true)
-            sso =
-              SingleSignOnRecord
-                .where(user_id: user.id)
-                .where("external_id LIKE ?", "mastodon:%")
-                .first
-            sso&.update_columns(external_email: new_email)
-          rescue => e
-            Rails.logger.warn(
-              "Mastodon profile sync: email update failed for user #{user.id}: #{e.message}"
-            )
-          end
-        end
-
-        # --- bio (note field) -----------------------------------------------
-        new_bio = strip_html(mastodon_user["note"].to_s).strip
-        profile = user.user_profile
-        if new_bio != profile.bio_raw.to_s.strip
-          profile.bio_raw = new_bio
-          profile.save!(validate: false)
-        end
-
-        # --- avatar ---------------------------------------------------------
-        avatar_url = mastodon_user["avatar"].to_s.strip
-        # last_payload is the last successful Mastodon snapshot; avoid re-downloading when
-        # the URL is unchanged. The first-link payload omits avatar so it downloads once.
-        previous_avatar_url =
-          begin
-            JSON.parse(sso&.last_payload.to_s)["avatar"].to_s.strip
-          rescue JSON::ParserError
-            ""
-          end
-        if avatar_url.present? && avatar_url != previous_avatar_url
-          Jobs.enqueue(
-            :download_avatar_from_url,
-            url: avatar_url,
-            user_id: user.id,
-            override_gravatar: true
-          )
-        end
-
-        # Apply scalar field changes (name, etc.) atomically.
-        user.update!(changes) if changes.any?
-
-        # Keep SingleSignOnRecord in sync with what we just applied.
-        if sso
-          sso.update_columns(
-            external_name: new_name,
-            external_username: mastodon_user["username"],
-            last_payload: mastodon_user.to_json
-          )
-        end
+        # Serialise per user so a login and an explicit sync can't both enqueue the avatar job.
+        DistributedMutex.synchronize(
+          "mastodon-profile-sync-#{user.id}",
+          validity: 30
+        ) { apply_profile_sync(user, mastodon_user) }
       rescue => e
         # Sync failure must not block login.
         Rails.logger.warn(
@@ -206,9 +140,89 @@ after_initialize do
 
       private
 
-      # Strips HTML tags from Mastodon's note field (which is HTML).
-      def strip_html(html)
-        html.gsub(/<[^>]+>/, " ").gsub(/\s+/, " ").strip
+      def apply_profile_sync(user, mastodon_user)
+        # Keep the LIKE wildcard bound; interpolating this pattern alongside a hash
+        # condition raised a format error and stopped sync before any fields were applied.
+        sso =
+          SingleSignOnRecord
+            .where(user_id: user.id)
+            .where("external_id LIKE ?", "mastodon:%")
+            .first
+
+        # Each field is isolated so one failure doesn't stop the others.
+        new_name =
+          mastodon_user["display_name"].presence || mastodon_user["username"]
+        safe_sync(user, "name") { sync_name(user, new_name) }
+        safe_sync(user, "email") { sync_email(user, sso, mastodon_user) }
+        safe_sync(user, "bio") { sync_bio(user, mastodon_user) }
+
+        avatar_url = mastodon_user["avatar"].to_s.strip
+        # last_payload is the last successful Mastodon snapshot; avoid re-downloading when
+        # the URL is unchanged. The first-link payload omits avatar so it downloads once.
+        previous_avatar_url =
+          begin
+            JSON.parse(sso&.last_payload.to_s)["avatar"].to_s.strip
+          rescue JSON::ParserError
+            ""
+          end
+
+        # Save the snapshot before enqueueing so a later failure can't cause repeated downloads.
+        sso&.update_columns(
+          external_name: new_name,
+          external_username: mastodon_user["username"],
+          last_payload:
+            mastodon_user.slice("id", "username", "display_name", "avatar").to_json
+        )
+
+        if avatar_url.present? && avatar_url != previous_avatar_url
+          safe_sync(user, "avatar") do
+            Jobs.enqueue(
+              :download_avatar_from_url,
+              url: avatar_url,
+              user_id: user.id,
+              override_gravatar: true
+            )
+          end
+        end
+      end
+
+      def safe_sync(user, field)
+        yield
+      rescue => e
+        Rails.logger.warn(
+          "Mastodon profile sync: #{field} update failed for user #{user.id}: #{e.class}: #{e.message}"
+        )
+      end
+
+      def sync_name(user, new_name)
+        user.update!(name: new_name) if new_name.present? && user.name != new_name
+      end
+
+      # Only update when Mastodon returns a confirmed email that differs.
+      def sync_email(user, sso, mastodon_user)
+        new_email = mastodon_user.dig("source", "email").to_s.strip.downcase
+        return unless EmailAddressValidator.valid_value?(new_email)
+        return if user.email.to_s.downcase == new_email
+
+        # Fails validation if another account owns this address; that is logged by safe_sync.
+        user.primary_email.update!(email: new_email)
+        sso&.update_columns(external_email: new_email)
+      end
+
+      def sync_bio(user, mastodon_user)
+        new_bio = html_to_text(mastodon_user["note"].to_s)
+        profile = user.user_profile
+        return if new_bio == profile.bio_raw.to_s.strip
+
+        profile.bio_raw = new_bio
+        profile.save!(validate: false)
+      end
+
+      # Converts Mastodon's HTML note to plain text, keeping paragraph/line breaks.
+      def html_to_text(html)
+        html = html.gsub(%r{<br\s*/?>}i, "\n").gsub(%r{</p>\s*<p[^>]*>}i, "\n\n")
+        text = Nokogiri::HTML.fragment(html).text
+        text.gsub(/[ \t]+/, " ").gsub(/ *\n */, "\n").gsub(/\n{3,}/, "\n\n").strip
       end
     end
 
@@ -539,9 +553,29 @@ after_initialize do
     end
   end
 
+  require_relative "lib/native_push"
+  require_relative "lib/native_push_events"
+  PostAlerter.prepend(DiscourseMastodonMobileSso::NativePostAlerterExtension)
+
+  on(:chat_message_created) do |message, *_args|
+    DiscourseMastodonMobileSso::NativePushEvents.chat_reply(message)
+  end
+
+  if defined?(::Chat::MessageReaction)
+    add_model_callback(::Chat::MessageReaction, :after_commit, on: :create) do
+      DiscourseMastodonMobileSso::NativePushEvents.chat_reaction(self)
+    end
+  end
+
+  on(:push_notification) do |user, payload|
+    DiscourseMastodonMobileSso::NativePush.enqueue(user, payload)
+  end
+
   DiscourseMastodonMobileSso::Engine.routes.draw do
     post "/auth/mastodon" => "auth#authenticate"
     post "/sync/profile" => "sync#profile"
+    post "/push/device" => "push_devices#register"
+    delete "/push/device" => "push_devices#destroy"
   end
 
   # Exposes the engine at /mobile_sso so the full paths are:

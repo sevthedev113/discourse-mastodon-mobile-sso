@@ -1,4 +1,11 @@
 en:
+  mastodon_mobile_push:
+    activity: "You have new activity in Groups."
+    unknown_actor: "Someone"
+    mention: "%{actor} mentioned you in Groups."
+    reply: "%{actor} replied to your post in Groups."
+    reaction: "%{actor} reacted to your post in Groups."
   site_settings:
+    mastodon_mobile_push_enabled: "Send native mobile push notifications using server-side Firebase credentials."
     mastodon_sso_host: "Base URL of the Mastodon server used for mobile SSO, for example https://mastodon.example.com"
     mastodon_sso_staff_email_allowlist: "Mastodon-confirmed emails that may sign in as an existing admin or moderator. Staff with any other email are never linked automatically."
