@@ -171,7 +171,11 @@ module DiscourseMastodonMobileSso
         end
       return I18n.t("mastodon_mobile_push.activity") if event == "activity"
 
-      actor_name = actor(payload)&.display_name.presence || payload[:username].presence ||
+      actor_user = actor(payload)
+      # Prefer display name, then Mastodon username, then Discourse username.
+      actor_name = actor_user&.name.presence ||
+        (actor_user && SingleSignOnRecord.where(user_id: actor_user.id).pick(:external_username).presence) ||
+        actor_user&.username.presence || payload[:username].presence ||
         I18n.t("mastodon_mobile_push.unknown_actor")
       I18n.t("mastodon_mobile_push.#{event}", actor: actor_name)
     end
