@@ -316,7 +316,9 @@ after_initialize do
                    id: user.id,
                    username: user.username,
                    name: user.name,
-                   email: user.email
+                   email: user.email,
+                   admin: user.admin?,
+                   moderator: user.moderator?
                  }
                }
       rescue MastodonApi::NotConfigured => e

@@ -66,7 +66,9 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
           "id" => user.id,
           "username" => user.username,
           "name" => "Alice",
-          "email" => email
+          "email" => email,
+          "admin" => false,
+          "moderator" => false
         }
       )
       expect(User.find_by_email("attacker@example.com")).to be_nil
@@ -273,6 +275,7 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       authenticate
       expect(response.status).to eq(200)
       expect(response.parsed_body["user"]["id"]).to eq(admin.id)
+      expect(response.parsed_body["user"]["admin"]).to eq(true)
       expect(session[:current_user_id]).to eq(admin.id)
     end
 
@@ -295,6 +298,7 @@ RSpec.describe DiscourseMastodonMobileSso::AuthController do
       authenticate
       expect(response.status).to eq(200)
       expect(response.parsed_body["user"]["id"]).to eq(moderator.id)
+      expect(response.parsed_body["user"]["moderator"]).to eq(true)
     end
 
     it "rejects an admin" do
